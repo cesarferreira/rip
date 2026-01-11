@@ -30,8 +30,7 @@ enum SortBy {
 }
 
 #[derive(Parser)]
-#[command(name = "rip")]
-#[command(about = "Fuzzy find and kill processes", long_about = None)]
+#[command(name = "rip", version, about = "Fuzzy find and kill processes", long_about = None)]
 struct Args {
     /// Pre-filter processes by name
     #[arg(short, long)]
