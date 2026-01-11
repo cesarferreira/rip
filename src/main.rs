@@ -68,8 +68,14 @@ fn truncate(s: &str, max_len: usize) -> String {
 
 /// Calculate available width for the name column based on terminal size
 fn calculate_name_width(ports_mode: bool) -> usize {
-    let term_width = terminal_size()
-        .map(|(Width(w), _)| w as usize)
+    // Get terminal width, defaulting to 80 if detection fails
+    let detected_width = terminal_size().map(|(Width(w), _)| w as usize);
+
+    // Use detected width, but enforce a minimum usable width
+    // This helps in environments where detection may report incorrect values (e.g., tmux)
+    let min_usable_width = if ports_mode { 60 } else { 50 };
+    let term_width = detected_width
+        .map(|w| w.max(min_usable_width))
         .unwrap_or(80);
 
     // Fixed columns: checkbox(6) + PID(7) + CPU(7) + Memory(9) + spaces(4)
