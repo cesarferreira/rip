@@ -1,6 +1,6 @@
 [package]
 name = "rip-cli"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "Fuzzy find and kill processes from your terminal"
 license = "MIT"
@@ -15,10 +15,12 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 sysinfo = "0.32"
-nix = { version = "0.29", features = ["signal"] }
 colored = "2"
 inquire = "0.7"
 terminal_size = "0.4"
 ratatui = "0.29"
 crossterm = "0.28"
 listeners = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }

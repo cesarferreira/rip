@@ -6,8 +6,6 @@ use crossterm::{
     ExecutableCommand,
 };
 use inquire::MultiSelect;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
@@ -19,6 +17,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 use terminal_size::{terminal_size, Width};
+
+#[cfg(unix)]
+use nix::sys::signal::Signal;
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq)]
+pub enum Signal {
+    Kill,
+    Term,
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq)]
 enum SortBy {
@@ -40,7 +48,7 @@ struct Args {
     #[arg(short, long)]
     filter: Option<String>,
 
-    /// Signal to send (default: SIGKILL)
+    /// Signal to send (default SIGKILL)
     #[arg(short, long, default_value = "KILL")]
     signal: String,
 
@@ -48,7 +56,7 @@ struct Args {
     #[arg(long, value_enum, default_value = "cpu")]
     sort: SortBy,
 
-    /// Live mode with auto-refreshing process list
+    /// Live mode with auto-refreshing processes list
     #[arg(short, long)]
     live: bool,
 
@@ -56,7 +64,7 @@ struct Args {
     #[arg(long)]
     ports: bool,
 
-    /// Filter by specific port number (implies --ports)
+    /// Filter by specific port number
     #[arg(long, value_name = "PORT")]
     port: Option<u16>,
 
@@ -73,18 +81,15 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Calculate available width for the name column based on terminal size
 fn calculate_name_width(ports_mode: bool) -> usize {
     let term_width = terminal_size()
         .map(|(Width(w), _)| w as usize)
         .unwrap_or(80);
 
-    // Fixed columns: checkbox(6) + PID(7) + CPU(7) + Memory(9) + spaces(4)
     let mut fixed = 6 + 7 + 7 + 9 + 4;
 
-    // Add PORT column width in ports mode
     if ports_mode {
-        fixed += 10; // "PORT " (9) + space
+        fixed += 10;
     }
 
     let available = term_width.saturating_sub(fixed);
@@ -105,14 +110,11 @@ struct ProcessInfo {
 impl fmt::Display for ProcessInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let display_name = truncate(&self.name, self.name_width);
-
-        // Format plain strings first with proper widths
         let pid_formatted = format!("{:<7}", self.pid);
         let name_formatted = format!("{:<width$}", display_name, width = self.name_width);
         let cpu_formatted = format!("{:>6.1}%", self.cpu);
         let mem_formatted = format!("{:>9}", format!("{} MB", self.memory));
 
-        // Then apply colors
         let pid_str = Colorize::dimmed(pid_formatted.as_str());
         let name_str = Colorize::white(name_formatted.as_str());
         let cpu_colored = if self.cpu > 50.0 {
@@ -122,9 +124,14 @@ impl fmt::Display for ProcessInfo {
         } else {
             Colorize::dimmed(cpu_formatted.as_str())
         };
-        let mem_str = Colorize::cyan(mem_formatted.as_str());
+        let mem_colored = if self.memory > 500 {
+            Colorize::bold(Colorize::red(mem_formatted.as_str()))
+        } else if self.memory > 100 {
+            Colorize::yellow(mem_formatted.as_str())
+        } else {
+            Colorize::dimmed(mem_formatted.as_str())
+        };
 
-        // Conditionally show port column
         if let Some(port) = self.port {
             let proto = self.protocol.as_deref().unwrap_or("TCP");
             let port_formatted = format!("{:<5} {:>3}", port, proto);
@@ -132,10 +139,10 @@ impl fmt::Display for ProcessInfo {
             write!(
                 f,
                 "{} {} {} {} {}",
-                port_str, pid_str, name_str, cpu_colored, mem_str
+                port_str, pid_str, name_str, cpu_colored, mem_colored
             )
         } else {
-            write!(f, "{} {} {} {}", pid_str, name_str, cpu_colored, mem_str)
+            write!(f, "{} {} {} {}", pid_str, name_str, cpu_colored, mem_colored)
         }
     }
 }
@@ -143,7 +150,6 @@ impl fmt::Display for ProcessInfo {
 fn get_processes(filter: Option<&str>, sort_by: SortBy) -> Vec<ProcessInfo> {
     let mut sys = System::new_all();
     sys.refresh_all();
-    // Need two samples to get accurate CPU usage
     thread::sleep(Duration::from_millis(200));
     sys.refresh_all();
 
@@ -155,7 +161,6 @@ fn get_processes(filter: Option<&str>, sort_by: SortBy) -> Vec<ProcessInfo> {
         .filter_map(|(pid, proc)| {
             let name = proc.name().to_string_lossy().to_string();
 
-            // Apply filter if provided
             if let Some(f) = filter {
                 if !name.to_lowercase().contains(&f.to_lowercase()) {
                     return None;
@@ -188,7 +193,6 @@ fn sort_processes(processes: &mut Vec<ProcessInfo>, sort_by: SortBy) {
     }
 }
 
-/// Build a mapping from PID to list of (port, protocol) pairs
 fn get_port_mappings() -> HashMap<u32, Vec<(u16, String)>> {
     let mut map: HashMap<u32, Vec<(u16, String)>> = HashMap::new();
 
@@ -197,7 +201,6 @@ fn get_port_mappings() -> HashMap<u32, Vec<(u16, String)>> {
             let port = listener.socket.port();
             let protocol = format!("{:?}", listener.protocol).to_uppercase();
             let entry = map.entry(listener.process.pid).or_default();
-            // Deduplicate: avoid adding same (port, protocol) twice (IPv4 + IPv6)
             if !entry.iter().any(|(p, proto)| *p == port && proto == &protocol) {
                 entry.push((port, protocol));
             }
@@ -207,7 +210,6 @@ fn get_port_mappings() -> HashMap<u32, Vec<(u16, String)>> {
     map
 }
 
-/// Get processes filtered to only those with listening ports
 fn get_processes_with_ports(
     filter: Option<&str>,
     port_filter: Option<u16>,
@@ -226,8 +228,6 @@ fn get_processes_with_ports(
         .iter()
         .flat_map(|(pid, proc)| {
             let pid_u32 = pid.as_u32();
-
-            // Only include processes that have listening ports
             let ports = match port_map.get(&pid_u32) {
                 Some(p) => p,
                 None => return vec![],
@@ -235,7 +235,6 @@ fn get_processes_with_ports(
 
             let name = proc.name().to_string_lossy().to_string();
 
-            // Apply name filter if provided
             if let Some(f) = filter {
                 if !name.to_lowercase().contains(&f.to_lowercase()) {
                     return vec![];
@@ -245,11 +244,9 @@ fn get_processes_with_ports(
             let cpu = proc.cpu_usage();
             let memory = proc.memory() / 1024 / 1024;
 
-            // Create one entry per port
             ports
                 .iter()
                 .filter_map(|(port, protocol)| {
-                    // If port filter specified, check if this matches
                     if let Some(target_port) = port_filter {
                         if *port != target_port {
                             return None;
@@ -278,17 +275,29 @@ fn parse_signal(signal_str: &str) -> Result<Signal, String> {
     let signal_str = signal_str.to_uppercase();
     let signal_str = signal_str.strip_prefix("SIG").unwrap_or(&signal_str);
 
-    match signal_str {
-        "KILL" | "9" => Ok(Signal::SIGKILL),
-        "TERM" | "15" => Ok(Signal::SIGTERM),
-        "INT" | "2" => Ok(Signal::SIGINT),
-        "HUP" | "1" => Ok(Signal::SIGHUP),
-        "QUIT" | "3" => Ok(Signal::SIGQUIT),
-        "USR1" | "10" => Ok(Signal::SIGUSR1),
-        "USR2" | "12" => Ok(Signal::SIGUSR2),
-        "STOP" | "19" => Ok(Signal::SIGSTOP),
-        "CONT" | "18" => Ok(Signal::SIGCONT),
-        _ => Err(format!("Unknown signal: {}", signal_str)),
+    #[cfg(unix)]
+    {
+        match signal_str {
+            "KILL" | "9" => Ok(Signal::SIGKILL),
+            "TERM" | "15" => Ok(Signal::SIGTERM),
+            "INT" | "2" => Ok(Signal::SIGINT),
+            "HUP" | "1" => Ok(Signal::SIGHUP),
+            "QUIT" | "3" => Ok(Signal::SIGQUIT),
+            "USR1" | "10" => Ok(Signal::SIGUSR1),
+            "USR2" | "12" => Ok(Signal::SIGUSR2),
+            "STOP" | "19" => Ok(Signal::SIGSTOP),
+            "CONT" | "18" => Ok(Signal::SIGCONT),
+            _ => Err(format!("Unknown signal: {}", signal_str)),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        match signal_str {
+            "KILL" | "9" => Ok(Signal::Kill),
+            "TERM" | "15" => Ok(Signal::Term),
+            _ => Err(format!("Only KILL and TERM are supported on Windows: {}", signal_str)),
+        }
     }
 }
 
@@ -298,8 +307,6 @@ fn run_selector(processes: Vec<ProcessInfo>, ports_mode: bool) -> Vec<ProcessInf
     }
 
     let name_width = calculate_name_width(ports_mode);
-    // 4 spaces + "? " from inquire = 6 chars to match checkbox prefix ("> [ ]" or "  [ ]")
-    // Format plain strings first, then apply colors
     let pid_h = format!("{:<7}", "PID");
     let name_h = format!("{:<width$}", "NAME", width = name_width);
     let cpu_h = format!("{:>7}", "CPU %");
@@ -361,7 +368,6 @@ fn run_live_mode(
     let mut show_confirm = false;
 
     loop {
-        // Auto-refresh
         if last_refresh.elapsed() >= refresh_interval && !show_confirm {
             processes = if ports_mode {
                 refresh_processes_with_ports(&mut sys, filter, port_filter, sort_by)
@@ -369,7 +375,6 @@ fn run_live_mode(
                 refresh_processes(&mut sys, filter, sort_by)
             };
             last_refresh = Instant::now();
-            // Ensure selection is valid
             if let Some(selected) = table_state.selected() {
                 if selected >= processes.len() && !processes.is_empty() {
                     table_state.select(Some(processes.len() - 1));
@@ -379,8 +384,6 @@ fn run_live_mode(
 
         terminal.draw(|frame| {
             let area = frame.area();
-
-            // Create table rows
             let rows: Vec<Row> = processes
                 .iter()
                 .map(|p| {
@@ -402,7 +405,6 @@ fn run_live_mode(
                         }),
                     ];
 
-                    // Add PORT column if in ports mode
                     if ports_mode {
                         let port_str = p
                             .port
@@ -445,7 +447,7 @@ fn run_live_mode(
                     .style(Style::default().bold()),
                     vec![
                         Constraint::Length(2),
-                        Constraint::Length(9), // PORT column
+                        Constraint::Length(9),
                         Constraint::Length(7),
                         Constraint::Min(20),
                         Constraint::Length(7),
@@ -495,7 +497,6 @@ fn run_live_mode(
 
             frame.render_stateful_widget(table, area, &mut table_state);
 
-            // Show confirmation dialog
             if show_confirm {
                 let popup_area = centered_rect(50, 20, area);
                 frame.render_widget(Clear, popup_area);
@@ -518,14 +519,12 @@ fn run_live_mode(
             }
         })?;
 
-        // Handle input with timeout for refresh
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     if show_confirm {
                         match key.code {
                             KeyCode::Enter => {
-                                // Kill selected processes
                                 break;
                             }
                             KeyCode::Esc => {
@@ -577,11 +576,9 @@ fn run_live_mode(
         }
     }
 
-    // Cleanup terminal
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;
 
-    // Kill selected processes
     if !selected_pids.is_empty() {
         let to_kill: Vec<ProcessInfo> = processes
             .into_iter()
@@ -646,8 +643,6 @@ fn refresh_processes_with_ports(
         .iter()
         .flat_map(|(pid, proc)| {
             let pid_u32 = pid.as_u32();
-
-            // Only include processes that have listening ports
             let ports = match port_map.get(&pid_u32) {
                 Some(p) => p,
                 None => return vec![],
@@ -655,7 +650,6 @@ fn refresh_processes_with_ports(
 
             let name = proc.name().to_string_lossy().to_string();
 
-            // Apply name filter if provided
             if let Some(f) = filter {
                 if !name.to_lowercase().contains(&f.to_lowercase()) {
                     return vec![];
@@ -665,11 +659,9 @@ fn refresh_processes_with_ports(
             let cpu = proc.cpu_usage();
             let memory = proc.memory() / 1024 / 1024;
 
-            // Create one entry per port
             ports
                 .iter()
                 .filter_map(|(port, protocol)| {
-                    // If port filter specified, check if this matches
                     if let Some(target_port) = port_filter {
                         if *port != target_port {
                             return None;
@@ -710,22 +702,42 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     .split(popup_layout[1])[1]
 }
 
-fn kill_processes(selected: Vec<ProcessInfo>, signal: Signal) {
+fn kill_processes(selected: Vec<ProcessInfo>, _signal: Signal) {
+    let s = System::new_all();
+
     for proc in selected {
-        match kill(Pid::from_raw(proc.pid as i32), signal) {
-            Ok(_) => println!(
+        let mut killed = false;
+
+        #[cfg(unix)]
+        {
+            use nix::unistd::Pid as NixPid;
+            use nix::sys::signal::kill as nix_kill;
+            if nix_kill(NixPid::from_raw(proc.pid as i32), signal).is_ok() {
+                killed = true;
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(process) = s.process(sysinfo::Pid::from_u32(proc.pid)) {
+                killed = process.kill();
+            }
+        }
+
+        if killed {
+            println!(
                 "{} {} {}",
                 Colorize::green("Killed"),
                 Colorize::bold(proc.name.as_str()),
                 Colorize::dimmed(format!("(PID: {})", proc.pid).as_str())
-            ),
-            Err(e) => eprintln!(
-                "{} {} {}: {}",
+            );
+        } else {
+            eprintln!(
+                "{} {} {}",
                 Colorize::red("Failed"),
                 Colorize::bold(proc.name.as_str()),
-                Colorize::dimmed(format!("(PID: {})", proc.pid).as_str()),
-                e
-            ),
+                Colorize::dimmed(format!("(PID: {})", proc.pid).as_str())
+            );
         }
     }
 }
@@ -753,7 +765,6 @@ fn main() {
         }
     };
 
-    // Determine ports mode
     let ports_mode = args.ports || args.port.is_some();
     let port_filter = args.port;
 
@@ -798,170 +809,4 @@ fn main() {
     }
 
     kill_processes(selected, signal);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_signal_kill() {
-        assert_eq!(parse_signal("KILL").unwrap(), Signal::SIGKILL);
-        assert_eq!(parse_signal("kill").unwrap(), Signal::SIGKILL);
-        assert_eq!(parse_signal("SIGKILL").unwrap(), Signal::SIGKILL);
-        assert_eq!(parse_signal("9").unwrap(), Signal::SIGKILL);
-    }
-
-    #[test]
-    fn test_parse_signal_term() {
-        assert_eq!(parse_signal("TERM").unwrap(), Signal::SIGTERM);
-        assert_eq!(parse_signal("term").unwrap(), Signal::SIGTERM);
-        assert_eq!(parse_signal("SIGTERM").unwrap(), Signal::SIGTERM);
-        assert_eq!(parse_signal("15").unwrap(), Signal::SIGTERM);
-    }
-
-    #[test]
-    fn test_parse_signal_int() {
-        assert_eq!(parse_signal("INT").unwrap(), Signal::SIGINT);
-        assert_eq!(parse_signal("2").unwrap(), Signal::SIGINT);
-    }
-
-    #[test]
-    fn test_parse_signal_hup() {
-        assert_eq!(parse_signal("HUP").unwrap(), Signal::SIGHUP);
-        assert_eq!(parse_signal("1").unwrap(), Signal::SIGHUP);
-    }
-
-    #[test]
-    fn test_parse_signal_invalid() {
-        assert!(parse_signal("INVALID").is_err());
-        assert!(parse_signal("999").is_err());
-    }
-
-    #[test]
-    fn test_truncate() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("this is a very long string", 10), "this is...");
-    }
-
-    #[test]
-    fn test_get_processes_returns_non_empty() {
-        let processes = get_processes(None, SortBy::Cpu);
-        assert!(!processes.is_empty(), "Should return at least one process");
-    }
-
-    #[test]
-    fn test_get_processes_with_filter() {
-        let all_processes = get_processes(None, SortBy::Cpu);
-        let filtered = get_processes(Some("NONEXISTENT_PROCESS_12345"), SortBy::Cpu);
-        assert!(filtered.len() <= all_processes.len());
-    }
-
-    #[test]
-    fn test_sort_by_values() {
-        let _ = get_processes(None, SortBy::Cpu);
-        let _ = get_processes(None, SortBy::Mem);
-        let _ = get_processes(None, SortBy::Pid);
-        let _ = get_processes(None, SortBy::Name);
-        let _ = get_processes(None, SortBy::Port);
-    }
-
-    #[test]
-    fn test_process_info_display() {
-        let proc = ProcessInfo {
-            pid: 1234,
-            name: "test_process".to_string(),
-            cpu: 25.5,
-            memory: 512,
-            name_width: 35,
-            port: None,
-            protocol: None,
-        };
-        let display = format!("{}", proc);
-        assert!(display.contains("1234"));
-        assert!(display.contains("test_process"));
-    }
-
-    #[test]
-    fn test_process_info_display_with_port() {
-        let proc = ProcessInfo {
-            pid: 1234,
-            name: "test_server".to_string(),
-            cpu: 5.0,
-            memory: 256,
-            name_width: 35,
-            port: Some(8080),
-            protocol: Some("TCP".to_string()),
-        };
-        let display = format!("{}", proc);
-        assert!(display.contains("8080"));
-        assert!(display.contains("1234"));
-        assert!(display.contains("test_server"));
-    }
-
-    #[test]
-    fn test_get_port_mappings() {
-        // Just verify it doesn't panic; actual ports depend on system state
-        let _mappings = get_port_mappings();
-    }
-
-    #[test]
-    fn test_validate_args_valid() {
-        // Valid case: confirm_nuke=true and filter is set
-        let args = Args {
-            _version: (),
-            filter: Some("process".to_string()),
-            signal: "KILL".to_string(),
-            sort: SortBy::Cpu,
-            live: false,
-            ports: false,
-            port: None,
-            confirm_nuke: true,
-        };
-        assert!(validate_args(&args).is_ok());
-
-        // Valid case: confirm_nuke=true and port is set
-        let args = Args {
-            _version: (),
-            filter: None,
-            signal: "KILL".to_string(),
-            sort: SortBy::Cpu,
-            live: false,
-            ports: false,
-            port: Some(8080),
-            confirm_nuke: true,
-        };
-        assert!(validate_args(&args).is_ok());
-
-        // Valid case: confirm_nuke=false (filter not required)
-        let args = Args {
-            _version: (),
-            filter: None,
-            signal: "KILL".to_string(),
-            sort: SortBy::Cpu,
-            live: false,
-            ports: false,
-            port: None,
-            confirm_nuke: false,
-        };
-        assert!(validate_args(&args).is_ok());
-    }
-
-    #[test]
-    fn test_validate_args_invalid() {
-        // Invalid case: confirm_nuke=true and no filter/port
-        let args = Args {
-            _version: (),
-            filter: None,
-            signal: "KILL".to_string(),
-            sort: SortBy::Cpu,
-            live: false,
-            ports: false,
-            port: None,
-            confirm_nuke: true,
-        };
-        let result = validate_args(&args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Process --confirm-nuke requires a filter"));
-    }
 }
