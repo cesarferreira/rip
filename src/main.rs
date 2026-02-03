@@ -702,9 +702,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     .split(popup_layout[1])[1]
 }
 
-fn kill_processes(selected: Vec<ProcessInfo>, _signal: Signal) {
-    let s = System::new_all();
-
+fn kill_processes(selected: Vec<ProcessInfo>, signal: Signal) {
     for proc in selected {
         let mut killed = false;
 
@@ -719,6 +717,7 @@ fn kill_processes(selected: Vec<ProcessInfo>, _signal: Signal) {
 
         #[cfg(windows)]
         {
+            let s = System::new_all();
             if let Some(process) = s.process(sysinfo::Pid::from_u32(proc.pid)) {
                 killed = process.kill();
             }
